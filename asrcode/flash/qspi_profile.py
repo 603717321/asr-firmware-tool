@@ -45,7 +45,7 @@ def expected_registers(profile,names=None):
     return result
 
 
-def parse_sfdp(header,read):
+def parse_sfdp(header, read, *, jedec_id=b''):
     if header[:4]!=b'SFDP' or len(header)<8:raise ValueError('NOR SFDP signature missing')
     for index in range(header[6]+1):
         at=8+index*8
@@ -62,8 +62,19 @@ def parse_sfdp(header,read):
         erases=[(table[at],table[at+1]) for at in (28,30,32,34)]
         if (12,0x20) not in erases:raise ValueError('SFDP does not advertise 4 KiB erase opcode 20h')
         if capacity<=0 or capacity>0x1000000:raise ValueError('NOR capacity requires unsupported address mode')
-        if len(table)<44:raise ValueError('SFDP page geometry missing')
-        page_size=1<<((struct.unpack_from('<I',table,40)[0]>>4)&15)
-        if page_size<256:raise ValueError('Unsupported NOR page geometry')
-        return {'capacity':capacity,'erase_size':4096,'erase_opcode':0x20,'page_size':page_size,'source':'SFDP BFPT'}
+        source = 'SFDP BFPT'
+        if length < 44:
+            # The original nine-DWORD table has no page-size field. The
+            # Puya P25Q64L datasheet (sections 7, 10.32, 10.43) specifies a
+            # 256-byte page for this exact RDID and 64-Mbit geometry.
+            if length != 36 or row[2] != 1 or bytes(jedec_id) != b'\x85\x60\x17' or bits != 0x4000000:
+                raise ValueError('SFDP page geometry missing')
+            page_size = 256
+            source = 'SFDP BFPT + Puya P25Q64 datasheet'
+        else:
+            page_size = 1 << ((struct.unpack_from('<I', table, 40)[0] >> 4) & 15)
+        if page_size < 256:
+            raise ValueError('Unsupported NOR page geometry')
+        return {'capacity': capacity, 'erase_size': 4096, 'erase_opcode': 0x20,
+                'page_size': page_size, 'source': source}
     raise ValueError('SFDP basic parameter table missing')

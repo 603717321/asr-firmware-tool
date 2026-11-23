@@ -63,7 +63,10 @@ class FlashWriter(WritableQspi):
                 from asrcode.flash.qspi_profile import parse_sfdp
                 instructions=(0x0818045a,0x1c000c08,0,0)
                 sfdp=self.read_special(instructions,0,128)
-                self.nor_parameters=parse_sfdp(sfdp,lambda offset,length:self.read_special(instructions,offset,length))
+                self.nor_parameters = parse_sfdp(
+                    sfdp, lambda offset, length: self.read_special(instructions, offset, length),
+                    jedec_id=self.jedec_id,
+                )
                 if self.flash_size!=self.nor_parameters['capacity']:
                     raise RuntimeError('JEDEC density and SFDP capacity disagree')
                 break
