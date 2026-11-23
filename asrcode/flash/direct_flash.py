@@ -583,7 +583,7 @@ def write_direct(offset,data,port='COM10',stop_file=None,write_mode=None,*,verif
             'resume_from':resume,'resume_policy':'recheck_completed_blocks' if resume_check else 'trust_contiguous_completed_prefix',
             'unchecked_resume_bytes':0,
             'sectors':[],'processed_sectors':0,'programmed_sectors':0,'erased_sectors':0,
-            'skipped_sectors':0,'programmed_pages':0,'blank_pages_skipped':0,
+            'skipped_sectors':0,'preserved_sectors':0,'programmed_pages':0,'blank_pages_skipped':0,
             'verification_performed':False,'verified':False,'reboot_verified':False}
     result_path=run/'result.json'
     def save():
@@ -595,8 +595,7 @@ def write_direct(offset,data,port='COM10',stop_file=None,write_mode=None,*,verif
     if write_policy:
         report['write_scope']='declared_configuration_blocks'
         report['policy_sidecar']=write_policy['sidecar']
-        report['preserved_sectors']=0
-    q=None;start=time.monotonic();digest=hashlib.sha256()
+    q=None;start=time.monotonic();digest=hashlib.sha256();expected_digest=hashlib.sha256()
     try:
         q=(FastFlashWriter(port,baudrate=baudrate,records_dir=run) if baudrate!=115200 or run_dir is not None else FastFlashWriter(port))
         q.records_dir=run
@@ -633,6 +632,9 @@ def write_direct(offset,data,port='COM10',stop_file=None,write_mode=None,*,verif
         declared_parts = firmware_partitions(data) if partition == 'full' else []
         max_code_offset = max((p['offset'] + p['size'] for p in declared_parts), default=0x5b0000)
         code_limit = (max_code_offset + 4095) // 4096 * 4096
+        preserve_data = partition == 'full' and allowed_sectors is None
+        # Beyond both boundaries every sector is preserved; do not scan it.
+        scan_end = min(end, max(code_limit, 0x700000)) if preserve_data else end
         active_first=first
         if resume_write and not resume_check:
             while active_first<end and active_first in completed:
@@ -650,6 +652,7 @@ def write_direct(offset,data,port='COM10',stop_file=None,write_mode=None,*,verif
         check_stop(stop_file)
         direct=not (verify or erase or skip_equal)
         scan_samples={}
+        plan=None
         if write_policy:
             from asrcode.flash.config_write_guard import validate_block
             equal=[];different=[]
@@ -664,19 +667,26 @@ def write_direct(offset,data,port='COM10',stop_file=None,write_mode=None,*,verif
             report['comparison_plan']=plan
             report['comparison_completed_before_writes']=True
             print(f'配置范围预检完成：仅允许 {len(allowed_sectors)} 块；其余身份、校准及运行记录原样保留。',flush=True)
-        elif skip_equal and active_first<end:
+        elif skip_equal and max(offset, active_first) < scan_end:
             from asrcode.flash.asr_write_plan import scan_write_plan
-            scan_end = min(end, code_limit) if (partition == 'full' and allowed_sectors is None) else end
             scan_samples,plan=scan_write_plan(
                 lambda address,size:q.mapped_block(address,size,stop_file),max(offset,active_first),data[max(offset,active_first)-offset:scan_end-offset],
                 lambda:check_stop(stop_file),
                 lambda done,total:print(f'PROGRESS compare {done}/{total}',flush=True))
+            if preserve_data:
+                for key in ('equal_blocks', 'different_blocks'):
+                    plan[key] = [
+                        address for address in plan[key]
+                        if int(address, 16) < code_limit or
+                        (b'littlefs' not in scan_samples[int(address, 16)] and
+                         b'littlefs' not in data[int(address, 16)-offset:int(address, 16)-offset+4096])
+                    ]
             report['comparison_plan']=plan
             report['comparison_completed_before_writes']=True
             save()
             print(f"WRITE_PLAN equal={len(plan['equal_blocks'])} different={len(plan['different_blocks'])}",flush=True)
         total_diff_blocks = total
-        if skip_equal and 'plan' in locals() and plan and 'different_blocks' in plan:
+        if skip_equal and plan is not None:
             total_diff_blocks = len(plan['different_blocks'])
             if plan.get('equal_blocks'):
                 eq_cnt = len(plan['equal_blocks'])
@@ -694,15 +704,20 @@ def write_direct(offset,data,port='COM10',stop_file=None,write_mode=None,*,verif
                     continue
                 check_stop(stop_file);lo=max(sector,offset);hi=min(sector+4096,offset+len(data))
                 wanted=data[lo-offset:hi-offset]
-                if partition == 'full' and allowed_sectors is None and sector >= code_limit:
-                    old_sample = scan_samples.get(sector, b'')
-                    if sector >= 0x700000 or b'littlefs' in old_sample or b'littlefs' in wanted:
+                if preserve_data and sector >= code_limit:
+                    old_sample = scan_samples.get(sector)
+                    if sector < 0x700000 and old_sample is None and b'littlefs' not in wanted:
+                        old_sample = q.stable_mapped_block(sector, 4096, stop_file)
+                        if len(old_sample) != 4096:
+                            raise RuntimeError(f'Incomplete preservation check at {sector:#x}')
+                    if sector >= 0x700000 or b'littlefs' in (old_sample or b'') or b'littlefs' in wanted:
                         report['preserved_sectors'] += 1
                         report['skipped_sectors'] += 1
-                        report['sectors'].append({'offset': hex(sector), 'completed': True, 'verified': True, 'nvram_preserved': True})
-                        if verify: digest.update(old_sample[lo-sector:hi-sector] if old_sample else wanted)
+                        report['sectors'].append({'offset': hex(sector), 'completed': True,
+                                                  'verified': False, 'nvram_preserved': True})
                         continue
-                wanted=data[lo-offset:hi-offset]
+                if verify:
+                    expected_digest.update(wanted)
                 if resume_write and sector in completed:
                     observed=q.verified_block(sector,4096,stop_file)
                     if observed[lo-sector:hi-sector]==wanted:
@@ -712,6 +727,8 @@ def write_direct(offset,data,port='COM10',stop_file=None,write_mode=None,*,verif
                         if verify:digest.update(observed[lo-sector:hi-sector])
                         print(f'断点续写 {sector:#x}：设备内容核对一致',flush=True)
                         continue
+                    if skip_equal:
+                        scan_samples[sector] = observed
                 if skip_equal:
                     before=scan_samples[sector]
                     if before[lo-sector:hi-sector]==wanted:
@@ -858,18 +875,19 @@ def write_direct(offset,data,port='COM10',stop_file=None,write_mode=None,*,verif
                 print(f'WRITE_SPEED {min(address+65536,end,offset+len(data))-offset}/{len(data)} elapsed={total_write_time:.2f}',flush=True)
         if verify and report['unchecked_resume_bytes']:
             report['written_suffix_sha256']=digest.hexdigest()
-            expected=hashlib.sha256(data[report['unchecked_resume_bytes']:]).hexdigest()
+            expected=expected_digest.hexdigest()
             if report['written_suffix_sha256']!=expected:raise RuntimeError('Written suffix checksum mismatch')
             report.update(verification_performed=active_first<end,verified=False,
                           verification='written_suffix_only; resumed_prefix_not_rechecked',
                           verification_start=hex(offset+report['unchecked_resume_bytes']))
         elif verify:
             report['readback_sha256']=digest.hexdigest()
-            expected_hash=(hashlib.sha256(b''.join(data[at:at+4096] for at in sorted(allowed_sectors))).hexdigest()
-                           if allowed_sectors is not None else report['input_sha256'])
+            expected_hash=expected_digest.hexdigest()
             if report['readback_sha256']!=expected_hash:raise RuntimeError('Input-range checksum mismatch')
             report.update(verification_performed=True,verified=True,
-                          verification='declared_configuration_blocks_only' if write_policy else 'per_written_sector_physical_IP_vs_expected_and_input_comparison_for_skips')
+                          verification=('declared_configuration_blocks_only' if write_policy else
+                                        'input_range_excluding_preserved_sectors' if report['preserved_sectors'] else
+                                        'per_written_sector_physical_IP_vs_expected_and_input_comparison_for_skips'))
         else:
             report['verification']='not_requested; commands completed without post-write data readback'
         report['binary_read_recovery']=getattr(q,'binary_recovery_stats',{})

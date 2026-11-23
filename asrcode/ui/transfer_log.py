@@ -57,5 +57,7 @@ def completion_summary(kind,details):
     if details.get('duration_seconds') is not None:parts.append('总耗时 '+duration(details['duration_seconds']))
     if kind=='write':
         parts.extend([f"写入 {details.get('programmed_sectors',0):,} 块",f"跳过 {details.get('skipped_sectors',0):,} 块"])
+        if details.get('preserved_sectors'):
+            parts.append(f"保留 {details['preserved_sectors']:,} 块，不计入校验")
         if details.get('unchecked_resume_bytes'):parts.append('续写前缀未复核')
     return ' · '.join(parts)
