@@ -1,0 +1,73 @@
+name: Build desktop releases
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: asr-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x64
+            runner: windows-2022
+            python: '3.8.10'
+          - target: linux-x64
+            runner: ubuntu-22.04
+            python: '3.12'
+          - target: macos-arm64
+            runner: macos-15
+            python: '3.12'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: ${{ matrix.target == 'macos-arm64' && 'arm64' || 'x64' }}
+      - if: runner.os == 'Windows'
+        run: python -m pip install -r requirements-win-legacy.txt
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgl1 libegl1 libxkbcommon-x11-0
+      - if: runner.os != 'Windows'
+        run: python -m pip install -r requirements.txt PyInstaller==6.16.0
+      - run: python build.py ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: artifacts/*
+          if-no-files-found: error
+
+  publish:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - working-directory: assets
+        run: sha256sum ASR-Firmware-Tool-* > SHA256SUMS.txt
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view continuous >/dev/null 2>&1; then
+            gh release upload continuous assets/* --clobber
+            gh release edit continuous --notes "Build commit: $GITHUB_SHA. Hardware I/O is not tested by CI."
+          else
+            gh release create continuous assets/* --target "$GITHUB_SHA" --title "ASR 固件读刷工具 · 连续构建" --notes "Build commit: $GITHUB_SHA. Hardware I/O is not tested by CI."
+          fi

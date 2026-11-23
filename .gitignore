@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.config.json
+读刷工具记录/
+*.bin
+*.pem
+build/
+dist/
+artifacts/
+*.spec
