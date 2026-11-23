@@ -773,7 +773,7 @@ class Window(QMainWindow):
     def __init__(self, config_path=None):
         super().__init__()
         configure_font(QApplication.instance())
-        self.setWindowTitle('ASR 固件读刷工具')
+        self.setWindowTitle('ASR固件读刷工具V1.0')
         self.config_path = Path(config_path) if config_path else ROOT/'ASR固件读刷工具.config.json'
         self.factory = Controls()
         self.worker = None
